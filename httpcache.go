@@ -9,23 +9,11 @@ package httpcache
 import (
 	"bufio"
 	"bytes"
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
-	"strings"
-	"sync"
-	"time"
-)
-
-type entryFreshness int
-
-const (
-	stale entryFreshness = iota
-	fresh
-	transparent
 )
 
 const (
@@ -49,19 +37,6 @@ type Doer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
-func (f entryFreshness) String() string {
-	switch f {
-	case stale:
-		return "stale"
-	case fresh:
-		return "fresh"
-	case transparent:
-		return "transparent"
-	}
-
-	return "undefined"
-}
-
 // cacheKey returns the cache key for req.
 func cacheKey(req *http.Request) string {
 	if req.Method == http.MethodGet {
@@ -69,52 +44,6 @@ func cacheKey(req *http.Request) string {
 	} else {
 		return req.Method + " " + req.URL.String()
 	}
-}
-
-// CachedResponse returns the cached http.Response for req if present, and nil
-// otherwise.
-func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error) {
-	cachedVal, ok := c.Get(cacheKey(req))
-	if !ok {
-		return
-	}
-
-	b := bytes.NewBuffer(cachedVal)
-	return http.ReadResponse(bufio.NewReader(b), req)
-}
-
-// MemoryCache is an implementation of Cache that stores responses in an in-memory map.
-type MemoryCache struct {
-	mu    sync.RWMutex
-	items map[string][]byte
-}
-
-// Get returns the []byte representation of the response and true if present, false if not
-func (mc *MemoryCache) Get(key string) (resp []byte, ok bool) {
-	mc.mu.RLock()
-	resp, ok = mc.items[key]
-	mc.mu.RUnlock()
-	return resp, ok
-}
-
-// Set saves response resp to the cache with key
-func (mc *MemoryCache) Set(key string, resp []byte, ttl int) {
-	mc.mu.Lock()
-	mc.items[key] = resp
-	mc.mu.Unlock()
-}
-
-// Delete removes key from the cache
-func (mc *MemoryCache) Delete(key string) {
-	mc.mu.Lock()
-	delete(mc.items, key)
-	mc.mu.Unlock()
-}
-
-// NewMemoryCache returns a new Cache that will store items in an in-memory map
-func NewMemoryCache() *MemoryCache {
-	c := &MemoryCache{items: map[string][]byte{}}
-	return c
 }
 
 type CacheOptions struct {
@@ -149,22 +78,22 @@ func NewMapCachedClient(client *http.Client) Doer {
 	return cc
 }
 
+// CachedResponse returns the cached http.Response for req if present, and nil
+// otherwise.
+func CachedResponse(c Cache, req *http.Request) (resp *http.Response, err error) {
+	cachedVal, ok := c.Get(cacheKey(req))
+	if !ok {
+		return
+	}
+
+	b := bytes.NewBuffer(cachedVal)
+	return http.ReadResponse(bufio.NewReader(b), req)
+}
+
 func (cc *CachedClient) log(message string) {
 	if cc.Options.Debug {
 		println(message)
 	}
-}
-
-// varyMatches will return false unless all of the cached values for the headers listed in Vary
-// match the new request
-func varyMatches(cachedResp *http.Response, req *http.Request) bool {
-	for _, header := range headerAllCommaSepValues(cachedResp.Header, "vary") {
-		header = http.CanonicalHeaderKey(header)
-		if header != "" && req.Header.Get(header) != cachedResp.Header.Get("X-Varied-"+header) {
-			return false
-		}
-	}
-	return true
 }
 
 // RoundTrip takes a Request and returns a Response
@@ -176,6 +105,10 @@ func varyMatches(cachedResp *http.Response, req *http.Request) bool {
 // to give the server a chance to respond with NotModified. If this happens, then the cached Response
 // will be returned.
 func (cc *CachedClient) Do(req *http.Request) (resp *http.Response, err error) {
+	return cc.doRequestInternal(req, err, resp)
+}
+
+func (cc *CachedClient) doRequestInternal(req *http.Request, err error, resp *http.Response) (*http.Response, error) {
 	cacheKey := cacheKey(req)
 	cacheable := (req.Method == "GET" || req.Method == "HEAD") && req.Header.Get("range") == ""
 	var cachedResp *http.Response
@@ -317,208 +250,14 @@ func (cc *CachedClient) Do(req *http.Request) (resp *http.Response, err error) {
 	return resp, nil
 }
 
-// ErrNoDateHeader indicates that the HTTP headers contained no Date header.
-var ErrNoDateHeader = errors.New("no Date header")
-
-// Date parses and returns the value of the Date header.
-func Date(respHeaders http.Header) (date time.Time, err error) {
-	dateHeader := respHeaders.Get("date")
-	if dateHeader == "" {
-		err = ErrNoDateHeader
-		return
-	}
-
-	return time.Parse(time.RFC1123, dateHeader)
-}
-
-type realClock struct{}
-
-func (c *realClock) since(d time.Time) time.Duration {
-	return time.Since(d)
-}
-
-type timer interface {
-	since(d time.Time) time.Duration
-}
-
-var clock timer = &realClock{}
-
-// getFreshness will return one of fresh/stale/transparent based on the cache-control
-// values of the request and the response
-//
-// fresh indicates the response can be returned
-// stale indicates that the response needs validating before it is returned
-// transparent indicates the response should not be used to fulfil the request
-//
-// Because this is only a private cache, 'public' and 'private' in cache-control aren't
-// signficant. Similarly, smax-age isn't used.
-func (cc *CachedClient) getFreshness(req *http.Request, respHeaders http.Header) (freshness entryFreshness) {
-	reqHeaders := req.Header
-	respCacheControl := parseCacheControl(respHeaders)
-	reqCacheControl := parseCacheControl(reqHeaders)
-	if _, ok := reqCacheControl["no-cache"]; ok {
-		cc.log(fmt.Sprintf("[httpcache](%p) request no-cache header found. returning transparent freshness", req))
-		return transparent
-	}
-	if _, ok := respCacheControl["no-cache"]; ok {
-		cc.log(fmt.Sprintf("[httpcache](%p) response no-cache header found. returning stale freshness", req))
-		return stale
-	}
-	if _, ok := reqCacheControl["only-if-cached"]; ok {
-		cc.log(fmt.Sprintf("[httpcache](%p) request only-if-cached header found. returning fresh freshness", req))
-		return fresh
-	}
-
-	date, err := Date(respHeaders)
-	if err != nil {
-		cc.log(fmt.Sprintf("[httpcache](%p) response date get error. returning stale freshness (%v)", req, err.Error()))
-		return stale
-	}
-	currentAge := clock.since(date)
-
-	var lifetime time.Duration
-	var zeroDuration time.Duration
-
-	// If a response includes both an Expires header and a max-age directive,
-	// the max-age directive overrides the Expires header, even if the Expires header is more restrictive.
-	if maxAge, ok := respCacheControl["max-age"]; ok {
-		lifetime, err = time.ParseDuration(maxAge + "s")
-		if err != nil {
-			lifetime = zeroDuration
-		}
-	} else {
-		expiresHeader := respHeaders.Get("Expires")
-		if expiresHeader != "" {
-			expires, err := time.Parse(time.RFC1123, expiresHeader)
-			if err != nil {
-				lifetime = zeroDuration
-			} else {
-				lifetime = expires.Sub(date)
-			}
-		}
-	}
-
-	if maxAge, ok := reqCacheControl["max-age"]; ok {
-		// the client is willing to accept a response whose age is no greater than the specified time in seconds
-		lifetime, err = time.ParseDuration(maxAge + "s")
-		if err != nil {
-			lifetime = zeroDuration
-		}
-	}
-	if minfresh, ok := reqCacheControl["min-fresh"]; ok {
-		//  the client wants a response that will still be fresh for at least the specified number of seconds.
-		minfreshDuration, err := time.ParseDuration(minfresh + "s")
-		if err == nil {
-			currentAge = time.Duration(currentAge + minfreshDuration)
-		}
-	}
-
-	if maxstale, ok := reqCacheControl["max-stale"]; ok {
-		// Indicates that the client is willing to accept a response that has exceeded its expiration time.
-		// If max-stale is assigned a value, then the client is willing to accept a response that has exceeded
-		// its expiration time by no more than the specified number of seconds.
-		// If no value is assigned to max-stale, then the client is willing to accept a stale response of any age.
-		//
-		// Responses served only because of a max-stale value are supposed to have a Warning header added to them,
-		// but that seems like a  hassle, and is it actually useful? If so, then there needs to be a different
-		// return-value available here.
-		if maxstale == "" {
-			cc.log(fmt.Sprintf("[httpcache](%p) request max-stale header found. returning fresh freshness", req))
-			return fresh
-		}
-		maxstaleDuration, err := time.ParseDuration(maxstale + "s")
-		if err == nil {
-			currentAge = time.Duration(currentAge - maxstaleDuration)
-		}
-	}
-
-	if lifetime > currentAge {
-		cc.log(fmt.Sprintf("[httpcache](%p) lifetime > currentAge. returning fresh freshness (%s, %s)", req, lifetime, currentAge))
-		return fresh
-	}
-
-	cc.log(fmt.Sprintf("[httpcache](%p) cannot infer freshness. fallback to stale freshness (lifetime: %s <= currentAge: %s)", req, lifetime, currentAge))
-	return stale
-}
-
-// Returns true if either the request or the response includes the stale-if-error
-// cache control extension: https://tools.ietf.org/html/rfc5861
-func canStaleOnError(respHeaders, reqHeaders http.Header) bool {
-	respCacheControl := parseCacheControl(respHeaders)
-	reqCacheControl := parseCacheControl(reqHeaders)
-
-	var err error
-	lifetime := time.Duration(-1)
-
-	if staleMaxAge, ok := respCacheControl["stale-if-error"]; ok {
-		if staleMaxAge != "" {
-			lifetime, err = time.ParseDuration(staleMaxAge + "s")
-			if err != nil {
-				return false
-			}
-		} else {
-			return true
-		}
-	}
-	if staleMaxAge, ok := reqCacheControl["stale-if-error"]; ok {
-		if staleMaxAge != "" {
-			lifetime, err = time.ParseDuration(staleMaxAge + "s")
-			if err != nil {
-				return false
-			}
-		} else {
-			return true
-		}
-	}
-
-	if lifetime >= 0 {
-		date, err := Date(respHeaders)
-		if err != nil {
+// varyMatches will return false unless all of the cached values for the headers listed in Vary
+// match the new request
+func varyMatches(cachedResp *http.Response, req *http.Request) bool {
+	for _, header := range headerAllCommaSepValues(cachedResp.Header, "vary") {
+		header = http.CanonicalHeaderKey(header)
+		if header != "" && req.Header.Get(header) != cachedResp.Header.Get("X-Varied-"+header) {
 			return false
 		}
-		currentAge := clock.since(date)
-		if lifetime > currentAge {
-			return true
-		}
-	}
-
-	return false
-}
-
-func getEndToEndHeaders(respHeaders http.Header) []string {
-	// These headers are always hop-by-hop
-	hopByHopHeaders := map[string]struct{}{
-		"Connection":          {},
-		"Keep-Alive":          {},
-		"Proxy-Authenticate":  {},
-		"Proxy-Authorization": {},
-		"Te":                  {},
-		"Trailers":            {},
-		"Transfer-Encoding":   {},
-		"Upgrade":             {},
-	}
-
-	for _, extra := range strings.Split(respHeaders.Get("connection"), ",") {
-		// any header listed in connection, if present, is also considered hop-by-hop
-		if strings.Trim(extra, " ") != "" {
-			hopByHopHeaders[http.CanonicalHeaderKey(extra)] = struct{}{}
-		}
-	}
-	endToEndHeaders := []string{}
-	for respHeader := range respHeaders {
-		if _, ok := hopByHopHeaders[respHeader]; !ok {
-			endToEndHeaders = append(endToEndHeaders, respHeader)
-		}
-	}
-	return endToEndHeaders
-}
-
-func canStore(reqCacheControl, respCacheControl cacheControl) (canStore bool) {
-	if _, ok := respCacheControl["no-store"]; ok {
-		return false
-	}
-	if _, ok := reqCacheControl["no-store"]; ok {
-		return false
 	}
 	return true
 }
@@ -546,71 +285,4 @@ func cloneRequest(r *http.Request) *http.Request {
 		r2.Header[k] = s
 	}
 	return r2
-}
-
-type cacheControl map[string]string
-
-func parseCacheControl(headers http.Header) cacheControl {
-	cc := cacheControl{}
-	ccHeader := headers.Get("Cache-Control")
-	for _, part := range strings.Split(ccHeader, ",") {
-		part = strings.Trim(part, " ")
-		if part == "" {
-			continue
-		}
-		if strings.ContainsRune(part, '=') {
-			keyval := strings.Split(part, "=")
-			cc[strings.Trim(keyval[0], " ")] = strings.Trim(keyval[1], ",")
-		} else {
-			cc[part] = ""
-		}
-	}
-	return cc
-}
-
-// headerAllCommaSepValues returns all comma-separated values (each
-// with whitespace trimmed) for header name in headers. According to
-// Section 4.2 of the HTTP/1.1 spec
-// (http://www.w3.org/Protocols/rfc2616/rfc2616-sec4.html#sec4.2),
-// values from multiple occurrences of a header should be concatenated, if
-// the header's value is a comma-separated list.
-func headerAllCommaSepValues(headers http.Header, name string) []string {
-	var vals []string
-	for _, val := range headers[http.CanonicalHeaderKey(name)] {
-		fields := strings.Split(val, ",")
-		for i, f := range fields {
-			fields[i] = strings.TrimSpace(f)
-		}
-		vals = append(vals, fields...)
-	}
-	return vals
-}
-
-// cachingReadCloser is a wrapper around ReadCloser R that calls OnEOF
-// handler with a full copy of the content read from R when EOF is
-// reached.
-type cachingReadCloser struct {
-	// Underlying ReadCloser.
-	R io.ReadCloser
-	// OnEOF is called with a copy of the content of R when EOF is reached.
-	OnEOF func(io.Reader)
-
-	buf bytes.Buffer // buf stores a copy of the content of R.
-}
-
-// Read reads the next len(p) bytes from R or until R is drained. The
-// return value n is the number of bytes read. If R has no data to
-// return, err is io.EOF and OnEOF is called with a full copy of what
-// has been read so far.
-func (r *cachingReadCloser) Read(p []byte) (n int, err error) {
-	n, err = r.R.Read(p)
-	r.buf.Write(p[:n])
-	if err == io.EOF {
-		r.OnEOF(bytes.NewReader(r.buf.Bytes()))
-	}
-	return n, err
-}
-
-func (r *cachingReadCloser) Close() error {
-	return r.R.Close()
 }

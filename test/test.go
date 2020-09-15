@@ -16,7 +16,7 @@ func Cache(t *testing.T, cache httpcache.Cache) {
 	}
 
 	val := []byte("some bytes")
-	cache.Set(key, val)
+	cache.Set(key, val, 5000)
 
 	retVal, ok := cache.Get(key)
 	if !ok {
