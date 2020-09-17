@@ -1,4 +1,4 @@
-// Package httpcache provides a http.RoundTripper wrapper implementation that works as a
+// Package httpcache provides a Doer wrapper implementation that works as a
 // mostly RFC-compliant cached client for http responses.
 //
 // It is only suitable for use as a 'private' cache (i.e. for a web-browser or an API-client
@@ -9,6 +9,7 @@ package httpcache
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -32,7 +33,7 @@ type Cache interface {
 	Delete(key string)
 }
 
-// A Doer interface abstracts the http.Client request execution from the client implementation
+// A Doer interface abstracts the *http.Client Do method from the client implementation
 type Doer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
@@ -56,7 +57,7 @@ type CacheOptions struct {
 type ClientOptions struct {
 }
 
-// CachedClient is an implementation of http.RoundTripper that will return values from a cache
+// CachedClient is an implementation of Doer that will return values from a cache
 // where possible (avoiding a network request) and will additionally add validators (etag/if-modified-since)
 // to repeated requests allowing servers to return 304 / Not Modified
 type CachedClient struct {
@@ -71,7 +72,12 @@ func NewCachedClient(client *http.Client, c Cache, options CacheOptions) Doer {
 	return &CachedClient{Cache: c, Transport: client.Transport, Options: options}
 }
 
-// NewMemoryCachedClient returns a new Transport using the in-memory map cache implementation
+func NewCachedClientRoundTripper(client *http.Client, c Cache, options CacheOptions) http.RoundTripper {
+	return &CachedClient{Cache: c, Transport: client.Transport, Options: options}
+}
+
+// NewMemoryCachedClient returns a new Doer using a locking in-memory map cache implementation
+// It is not optimized for real workloads so it should be used for testing only
 func NewMapCachedClient(client *http.Client) Doer {
 	c := NewMemoryCache()
 	cc := NewCachedClient(client, c, CacheOptions{})
@@ -96,7 +102,7 @@ func (cc *CachedClient) log(message string) {
 	}
 }
 
-// RoundTrip takes a Request and returns a Response
+// Do takes a Request and returns a Response, error pair, following the *http.Client Do method
 //
 // If there is a fresh Response already in cache, then it will be returned without connecting to
 // the server.
@@ -105,10 +111,15 @@ func (cc *CachedClient) log(message string) {
 // to give the server a chance to respond with NotModified. If this happens, then the cached Response
 // will be returned.
 func (cc *CachedClient) Do(req *http.Request) (resp *http.Response, err error) {
-	return cc.doRequestInternal(req, err, resp)
+	return executeRequest(cc, req, resp)
 }
 
-func (cc *CachedClient) doRequestInternal(req *http.Request, err error, resp *http.Response) (*http.Response, error) {
+func (cc *CachedClient) RoundTrip(req *http.Request) (resp *http.Response, err error) {
+	return executeRequest(cc, req, resp)
+}
+
+func executeRequest(cc *CachedClient, req *http.Request, resp *http.Response) (*http.Response, error) {
+	var err error
 	cacheKey := cacheKey(req)
 	cacheable := (req.Method == "GET" || req.Method == "HEAD") && req.Header.Get("range") == ""
 	var cachedResp *http.Response
@@ -200,7 +211,10 @@ func (cc *CachedClient) doRequestInternal(req *http.Request, err error, resp *ht
 		reqCacheControl := parseCacheControl(req.Header)
 		if _, ok := reqCacheControl["only-if-cached"]; ok {
 			cc.log(fmt.Sprintf("[httpcache](%p) non-cacheable or entry error detected with only-if-cached request. returning timeout", req))
-			resp = newGatewayTimeoutResponse(req)
+			resp, err = newGatewayTimeoutResponse(req)
+			if err != nil {
+				return nil, err
+			}
 		} else {
 			cc.log(fmt.Sprintf("[httpcache](%p) non-cacheable or entry error detected. executing remote request", req))
 			resp, err = cc.Transport.RoundTrip(req)
@@ -262,14 +276,14 @@ func varyMatches(cachedResp *http.Response, req *http.Request) bool {
 	return true
 }
 
-func newGatewayTimeoutResponse(req *http.Request) *http.Response {
-	var braw bytes.Buffer
-	braw.WriteString("HTTP/1.1 504 Gateway Timeout\r\n\r\n")
-	resp, err := http.ReadResponse(bufio.NewReader(&braw), req)
+func newGatewayTimeoutResponse(req *http.Request) (*http.Response, error) {
+	var buf bytes.Buffer
+	buf.WriteString("HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+	resp, err := http.ReadResponse(bufio.NewReader(&buf), req)
 	if err != nil {
-		panic(err)
+		return nil, errors.New("httpcache: could not write timeout response")
 	}
-	return resp
+	return resp, nil
 }
 
 // cloneRequest returns a clone of the provided *http.Request.
